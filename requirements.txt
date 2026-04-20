@@ -1,0 +1,9 @@
+# FOCtave core (bundled locally as foctave.py — same module as public
+# github.com/blucrew/FOCtave; kept in-tree so this repo is self-contained).
+numpy
+scipy
+soundfile
+
+# Video + GUI pipeline
+pillow
+imageio-ffmpeg
