@@ -222,7 +222,7 @@ TOOLTIPS = {
              "0.30 matches FunBelgium-style saturation; 0.50 ≈ sqrt; 1.0 ≈ linear.",
     "percentile": "Normalization reference point. Lower = more saturation "
                   "(peaks clip to 100 sooner). 75 matches FunBelgium; "
-                  "100 = peak-faithful. Use 95+ for dynamic preset.",
+                  "100 = peak-faithful. Use 95+ for the baked preset.",
     "attack_ms": "How fast the envelope rises on a new transient. "
                  "0 = instant (symmetric smoothing). Try 10-30 ms for a "
                  "musical, punchy feel that still catches beats.",
@@ -488,7 +488,7 @@ class StudioApp:
         self.audio_path = tk.StringVar()
         self.output_dir = tk.StringVar()
         self.project_name = tk.StringVar(value="untitled")
-        self.preset_var = tk.StringVar(value="belgium")
+        self.preset_var = tk.StringVar(value="french_fries")
 
         # Scenes: list[{"path": Path, "electrodes": dict, "overrides": {...}}]
         self.scenes: list[dict] = []
@@ -1096,8 +1096,7 @@ class StudioApp:
             # Convert takes seconds; render takes minutes. Allocate
             # 5% of the bar to convert and 95% to render so the bar
             # matches actual wall time instead of jumping ahead.
-            def convert_progress(frac, msg):
-                self._post_status(msg, 0.02 + frac * 0.03)
+            self._post_status(f"Converting {audio.name}...", 0.02)
 
             foctave.convert(
                 input_path=audio,
@@ -1110,9 +1109,20 @@ class StudioApp:
                 release_ms=tune["release_ms"],
                 floor=tune["floor"],
                 volume_ramp_pct_per_min=tune["volume_ramp"],
-                output_stem=name,
-                progress=convert_progress,
             )
+
+            # foctave.convert names outputs after the audio stem. Rename
+            # to the project stem (if different) so the project folder
+            # stays consistently named. Uses os.replace for atomic overwrite.
+            audio_stem = audio.stem
+            if audio_stem != name:
+                import os
+                for ch in ("e1", "e2", "e3", "e4", "volume"):
+                    src = proj_dir / f"{audio_stem}.{ch}.funscript"
+                    dst = proj_dir / f"{name}.{ch}.funscript"
+                    if src.exists():
+                        os.replace(str(src), str(dst))
+            self._post_status("Conversion done, starting render...", 0.05)
 
             # 3. Load funscripts back for render
             funscripts = {ch: render_mod.load_funscript(
@@ -1209,7 +1219,7 @@ class StudioApp:
         self._refresh_scene_list()
         self.canvas_widget.set_image(None)
         self._sync_scene_override_ui()
-        self.preset_var.set("belgium")
+        self.preset_var.set("french_fries")
         self._apply_preset()
         # Reset video vars to their construction defaults (matching __init__)
         self.video_vars["max_dim"].set(1280)
@@ -1315,7 +1325,14 @@ class StudioApp:
                 except Exception:
                     pass
         if "preset" in data:
-            self.preset_var.set(data["preset"])
+            # Migrate legacy preset names -> potato-themed names.
+            legacy = {"belgium": "french_fries", "dynamic": "baked",
+                      "endurance": "roasted", "comfort": "mashed"}
+            p = data["preset"]
+            p = legacy.get(p, p)
+            if p not in PRESETS:
+                p = "french_fries"
+            self.preset_var.set(p)
             # Don't re-apply preset defaults; tune values above win
         if "effect_style" in data:
             self.effect_style.set(data["effect_style"])
