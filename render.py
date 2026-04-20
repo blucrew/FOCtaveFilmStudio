@@ -223,70 +223,82 @@ def _stamp_at(canvas: np.ndarray, x: int, y: int, stamp: np.ndarray,
         canvas[dy0:dy1, dx0:dx1, c] += patch * color[c]
 
 
-def draw_segment_lights(canvas: np.ndarray, electrode_xys: list,
-                        e_values: np.ndarray, color: tuple[float, float, float],
-                        stamp: np.ndarray, brightness_scale: float = 200.0) -> list:
-    """Discrete bright spot per segment, positioned by intensity ratio of
-    its two endpoints (position = b / (a+b), so the spot slides toward the
-    hotter end). Brightness = average of the two endpoint values.
-
-    Returns the list of (x, y) spot positions so callers can stamp extras
-    (e.g. sparks layered on top)."""
-    positions = []
-    for i in range(len(electrode_xys) - 1):
-        a = float(e_values[i])
-        b = float(e_values[i + 1])
-        total = a + b
-        if total < 0.03:
-            positions.append(None)
-            continue
-        t = b / total  # 0 -> sits at endpoint a, 1 -> sits at endpoint b
-        pa = electrode_xys[i]
-        pb = electrode_xys[i + 1]
-        x = int(round(pa[0] + (pb[0] - pa[0]) * t))
-        y = int(round(pa[1] + (pb[1] - pa[1]) * t))
-        brightness = (a + b) * 0.5 * brightness_scale
-        _stamp_at(canvas, x, y, stamp, color, brightness)
-        positions.append((x, y))
-    return positions
+def _path_tangents(path_xys: np.ndarray) -> np.ndarray:
+    """Per-sample unit perpendicular normal for a path. Shape (N, 2).
+    Used by effects that need to jitter sideways off the curve."""
+    n = len(path_xys)
+    if n < 2:
+        return np.zeros((n, 2), dtype=np.float32)
+    pf = path_xys.astype(np.float32)
+    diff = np.zeros_like(pf)
+    diff[1:-1] = pf[2:] - pf[:-2]
+    diff[0] = pf[1] - pf[0]
+    diff[-1] = pf[-1] - pf[-2]
+    lens = np.maximum(1e-3, np.linalg.norm(diff, axis=1, keepdims=True))
+    tan = diff / lens
+    # perpendicular: (-dy, dx)
+    perp = np.stack([-tan[:, 1], tan[:, 0]], axis=1)
+    return perp
 
 
-def draw_segment_sparks(canvas: np.ndarray, electrode_xys: list,
-                        e_values: np.ndarray, color: tuple[float, float, float],
-                        stamp: np.ndarray, t_s: float,
-                        brightness_scale: float = 200.0) -> None:
-    """Like `draw_segment_lights` but with small jitter + brightness
-    twinkle driven by time, giving a crackling electric-arc feel."""
+def _bead_indices(n_samples: int, bead_spacing_samples: int) -> np.ndarray:
+    """Evenly-spaced sub-sampling indices along a path. `bead_spacing_samples`
+    is the stride in path-sample units — with build_path's 2 px per sample,
+    stride=15 gives ~30 px between beads."""
+    if n_samples <= 0:
+        return np.zeros(0, dtype=np.int32)
+    stride = max(1, int(bead_spacing_samples))
+    return np.arange(stride // 2, n_samples, stride, dtype=np.int32)
+
+
+def draw_path_beads(canvas: np.ndarray, path_xys: np.ndarray,
+                    path_intensities: np.ndarray,
+                    color: tuple[float, float, float],
+                    stamp: np.ndarray, bead_stride: int,
+                    brightness_scale: float = 200.0,
+                    perp: np.ndarray | None = None,
+                    t_s: float = 0.0, jitter: float = 0.0,
+                    twinkle: float = 0.0) -> None:
+    """Stamp one bead at every `bead_stride`-th path sample. Brightness is
+    driven by `path_intensities` at that sample — i.e. the same barycentric
+    × traveling-wave envelope the ribbon uses. Optional perpendicular jitter
+    and per-bead twinkle turn the same positioning into 'sparks'.
+
+    This unifies lights/sparks with ribbon: identical position logic along
+    the curve, identical intensity envelope, only the stamp stride, stamp
+    size, and jitter differ."""
     import math
-    # Pseudo-random per segment, deterministic from t_s
-    for i in range(len(electrode_xys) - 1):
-        a = float(e_values[i])
-        b = float(e_values[i + 1])
-        total = a + b
-        if total < 0.03:
+    h, w = canvas.shape[:2]
+    sh = stamp.shape[0]
+    r = sh // 2
+    idxs = _bead_indices(len(path_xys), bead_stride)
+    for order, i in enumerate(idxs):
+        inten = float(path_intensities[i])
+        if inten <= 0.04:
             continue
-        t = b / total
-        pa = electrode_xys[i]
-        pb = electrode_xys[i + 1]
-        base_x = pa[0] + (pb[0] - pa[0]) * t
-        base_y = pa[1] + (pb[1] - pa[1]) * t
-        # Perpendicular offset vector (unit) for jitter
-        dx = pb[0] - pa[0]
-        dy = pb[1] - pa[1]
-        seg_len = max(1.0, (dx * dx + dy * dy) ** 0.5)
-        nx = -dy / seg_len
-        ny = dx / seg_len
-        # Multi-spark: 3 tiny flickers near the core position, jittered
-        for k in range(3):
-            phase = t_s * 17.0 + i * 1.37 + k * 2.11
-            jitter = (math.sin(phase) * 0.3 + math.cos(phase * 2.3 + k) * 0.7) * seg_len * 0.08
-            ox = math.cos(phase * 3.1 + i) * 4
-            oy = math.sin(phase * 3.1 + i) * 4
-            x = int(round(base_x + nx * jitter + ox))
-            y = int(round(base_y + ny * jitter + oy))
-            twinkle = 0.55 + 0.45 * math.sin(phase * 5.7 + k * 1.7)
-            bright = (a + b) * 0.5 * brightness_scale * twinkle
-            _stamp_at(canvas, x, y, stamp, color, bright)
+        x = int(path_xys[i, 0])
+        y = int(path_xys[i, 1])
+        bright_mul = 1.0
+        if jitter > 0 and perp is not None:
+            phase = t_s * 14.0 + order * 1.37
+            off = math.sin(phase) * jitter
+            x = int(round(x + perp[i, 0] * off))
+            y = int(round(y + perp[i, 1] * off))
+        if twinkle > 0:
+            phase = t_s * 6.0 + order * 0.91
+            bright_mul *= (1.0 - twinkle) + twinkle * (0.5 + 0.5 * math.sin(phase))
+        bright = inten * brightness_scale * bright_mul
+        x0, x1 = x - r, x + r + 1
+        y0, y1 = y - r, y + r + 1
+        sx0 = max(0, -x0); sx1 = stamp.shape[1] - max(0, x1 - w)
+        sy0 = max(0, -y0); sy1 = stamp.shape[0] - max(0, y1 - h)
+        dx0 = max(0, x0); dx1 = min(w, x1)
+        dy0 = max(0, y0); dy1 = min(h, y1)
+        if dx0 >= dx1 or dy0 >= dy1:
+            continue
+        patch = stamp[sy0:sy1, sx0:sx1] * bright
+        for c in range(3):
+            canvas[dy0:dy1, dx0:dx1, c] += patch * color[c]
 
 
 def draw_path_ribbon(canvas: np.ndarray, path_xys: np.ndarray,
@@ -351,6 +363,7 @@ def _prepare_scene(image_path: Path, electrodes: dict, max_dim: int):
     ordered = [scaled[ch] for ch in ELECTRODE_CHANNELS]
     path_xys, path_weights = build_path(ordered, spacing_px=2.0)
     path_t = np.linspace(0.0, 1.0, len(path_xys), dtype=np.float32)
+    path_perp = _path_tangents(path_xys)
 
     return {
         "w": w, "h": h,
@@ -360,6 +373,7 @@ def _prepare_scene(image_path: Path, electrodes: dict, max_dim: int):
         "path_xys": path_xys,
         "path_weights": path_weights,
         "path_t": path_t,
+        "path_perp": path_perp,
     }
 
 
@@ -427,12 +441,13 @@ def render_multi(
         ordered = [fitted_elec[ch] for ch in ELECTRODE_CHANNELS]
         path_xys, path_weights = build_path(ordered, spacing_px=2.0)
         path_t = np.linspace(0.0, 1.0, len(path_xys), dtype=np.float32)
+        path_perp = _path_tangents(path_xys)
         prepped.append({
             "w": w, "h": h,
             "base_arr": base_arr, "bloom_arr": bloom_arr,
             "electrodes": fitted_elec,
             "path_xys": path_xys, "path_weights": path_weights,
-            "path_t": path_t,
+            "path_t": path_t, "path_perp": path_perp,
             "effect_opacity": float(s.get("overrides", {}).get("effect_opacity",
                                                                effect_opacity)),
         })
@@ -487,8 +502,9 @@ def render_multi(
     # image. Each prepped scene carries its own opacity (either overridden
     # for that scene or inherited from the global `effect_opacity`).
 
-    # Stamp for per-segment lights/sparks (slightly bigger than ribbon stamp
-    # so each spot has presence of its own).
+    # Stamp for bead-style effects (lights / sparks). Bigger than the ribbon
+    # stamp so each bead reads as its own point of light rather than blending
+    # into a continuous line.
     light_stamp = precompute_glow_stamp(int(min(w, h) * 0.06))
 
     def render_scene_frame(scene, vals, t_s):
@@ -501,21 +517,34 @@ def render_multi(
 
         scene_opacity = scene.get("effect_opacity", effect_opacity)
 
+        # --- Shared path-based intensity envelope (used by all styles) ---
+        # Barycentric blend: each path sample's value is the weighted average
+        # of its two adjacent electrodes. Traveling wave modulates this so
+        # the "signal" visibly flows head-to-tail along the curve.
+        path_intensity = scene["path_weights"] @ e_values
+        wave = 0.60 + 0.40 * np.sin(2 * np.pi * (scene["path_t"] * 2.0 - t_s * 1.2))
+        path_intensity = path_intensity * wave
+
         if effect_style == "lights":
-            electrode_xys = [scene["electrodes"][ch] for ch in ELECTRODE_CHANNELS]
-            draw_segment_lights(canvas, electrode_xys, e_values,
-                                effect_color, light_stamp,
-                                brightness_scale=200.0 * scene_opacity)
+            # Discrete beads along the same curve, same envelope — just a
+            # sparser sub-sampling with a bigger stamp per point.
+            draw_path_beads(canvas, scene["path_xys"], path_intensity,
+                            effect_color, light_stamp,
+                            bead_stride=scene.get("bead_stride", 14),
+                            brightness_scale=190.0 * scene_opacity)
         elif effect_style == "sparks":
-            electrode_xys = [scene["electrodes"][ch] for ch in ELECTRODE_CHANNELS]
-            draw_segment_sparks(canvas, electrode_xys, e_values,
-                                effect_color, light_stamp, t_s,
-                                brightness_scale=160.0 * scene_opacity)
+            # Same beads + perpendicular jitter off the curve + per-bead
+            # twinkle for crackle. Still travels head-to-tail via `wave`.
+            draw_path_beads(canvas, scene["path_xys"], path_intensity,
+                            effect_color, light_stamp,
+                            bead_stride=scene.get("bead_stride", 14),
+                            brightness_scale=170.0 * scene_opacity,
+                            perp=scene["path_perp"], t_s=t_s,
+                            jitter=scene.get("spark_jitter_px", 6.0),
+                            twinkle=0.55)
         else:
-            # Default: ribbon
-            path_intensity = scene["path_weights"] @ e_values
-            wave = 0.60 + 0.40 * np.sin(2 * np.pi * (scene["path_t"] * 2.0 - t_s * 1.2))
-            path_intensity = path_intensity * wave
+            # Ribbon: every path sample stamped with a soft small glow,
+            # giving a continuous flowing line.
             ribbon_thickness = 0.55 + 0.45 * vol
             draw_path_ribbon(canvas, scene["path_xys"], path_intensity, effect_color,
                              ribbon_stamp, ribbon_thickness,
