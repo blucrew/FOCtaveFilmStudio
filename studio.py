@@ -1101,31 +1101,22 @@ class StudioApp:
             proj_dir = outdir / name
             proj_dir.mkdir(parents=True, exist_ok=True)
 
-            # 1. Update per-image library sidecars only. We intentionally do
-            # NOT write a combined electrodes/scenes JSON into the output
-            # folder: that file would reference absolute paths to source
-            # images outside the package, which isn't useful as a deliverable.
-            # Project-level metadata lives in File > Save project (.foctave.json).
+            # 1. Record each image's electrodes in the central library
+            # (~/.foctave/library.json), keyed by source path. We deliberately
+            # do NOT write sidecar .electrodes.json files next to the source
+            # images — that scattered JSON files across the user's filesystem
+            # wherever they happened to keep stills. The central library +
+            # project .foctave.json are the source of truth.
             for s in scenes:
                 img_path = s["path"]
-                iw, ih = Image.open(img_path).size
-                sidecar = img_path.with_suffix(".electrodes.json")
                 try:
-                    sidecar.write_text(json.dumps({
-                        "image": img_path.name,
-                        "image_size": {"w": iw, "h": ih},
-                        "electrodes": {k: {"x": v[0], "y": v[1]}
-                                       for k, v in s["electrodes"].items()},
-                    }, indent=2), encoding="utf-8")
-                except Exception as e:
-                    print(f"Warning: couldn't write library sidecar {sidecar}: {e}")
-                # Also record in the central cross-project library
-                try:
+                    iw, ih = Image.open(img_path).size
                     library_record(img_path, s["electrodes"], (iw, ih))
                 except Exception as e:
-                    print(f"Warning: couldn't update central library: {e}")
+                    print(f"Warning: couldn't update central library for "
+                          f"{img_path}: {e}")
 
-            self._post_status("Saved sidecars + library", 0.02)
+            self._post_status("Recorded placements in library", 0.02)
 
             # 2. Convert audio -> funscripts.
             # Convert takes seconds; render takes minutes. Allocate
@@ -1201,6 +1192,17 @@ class StudioApp:
                 ribbon_color=rc,
                 progress=render_progress,
             )
+
+            # 5. Archive copies of the scene images inside the project
+            # folder so the deliverable is self-contained. This is the ONLY
+            # place we copy images; during edit/render the source paths are
+            # read from where the user keeps them.
+            for s in scenes:
+                try:
+                    import_image_to_project(Path(s["path"]), proj_dir)
+                except Exception as e:
+                    print(f"Warning: couldn't archive {s['path']} into "
+                          f"project folder: {e}")
 
             self._post_status(f"✓ Done. Project at {proj_dir}", 1.0, done=True,
                               final_folder=proj_dir)
