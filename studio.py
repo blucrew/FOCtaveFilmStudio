@@ -621,11 +621,21 @@ class StudioApp:
         sb.pack(side="right", fill="y")
         self.scene_listbox.pack(side="left", fill="both", expand=True)
         self.scene_listbox.bind("<<ListboxSelect>>", self._on_scene_select)
+        # Space/double-click toggles whether the selected scene is included
+        # in the render.
+        self.scene_listbox.bind("<space>", lambda e: self._toggle_scene_enabled())
+        self.scene_listbox.bind("<Double-Button-1>", lambda e: self._toggle_scene_enabled())
 
         btns = tk.Frame(panel, bg="#1a1a1a")
         btns.pack(fill="x", padx=6, pady=4)
         ttk.Button(btns, text="+ Add image", command=self._add_scene).pack(side="left", padx=2)
         ttk.Button(btns, text="− Remove", command=self._remove_scene).pack(side="left", padx=2)
+        tog = ttk.Button(btns, text="Toggle ✓", command=self._toggle_scene_enabled)
+        tog.pack(side="left", padx=2)
+        Tooltip(tog, "Include / exclude the selected scene in the next render. "
+                     "Disabled scenes stay in the project (with their electrode "
+                     "placements) but are skipped. Space or double-click also "
+                     "toggles.")
 
         ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=6, padx=8)
 
@@ -891,7 +901,8 @@ class StudioApp:
                     for lab, pos in entry.get("electrodes", {}).items():
                         if lab in LABELS:
                             electrodes[lab] = (int(pos["x"]), int(pos["y"]))
-            self.scenes.append({"path": pth, "electrodes": electrodes, "overrides": {}})
+            self.scenes.append({"path": pth, "electrodes": electrodes,
+                                "overrides": {}, "enabled": True})
         self._dlg_remember("image", paths[0])
         self._refresh_scene_list()
         if self.active_scene_idx < 0:
@@ -912,16 +923,32 @@ class StudioApp:
             self._load_active_scene()
         self._refresh_scene_list()
 
+    def _scene_row_label(self, scene: dict) -> str:
+        placed = len(scene["electrodes"])
+        name = Path(scene["path"]).name
+        short = name if len(name) <= 20 else name[:17] + "..."
+        mark = "☑" if scene.get("enabled", True) else "☐"
+        return f"{mark} {short} ({placed}/4)"
+
     def _refresh_scene_list(self):
         self.scene_listbox.delete(0, tk.END)
         for i, scene in enumerate(self.scenes):
-            placed = len(scene["electrodes"])
-            name = Path(scene["path"]).name
-            short = name if len(name) <= 22 else name[:19] + "..."
-            self.scene_listbox.insert(tk.END, f"{short} ({placed}/4)")
+            self.scene_listbox.insert(tk.END, self._scene_row_label(scene))
+            # Grey out disabled rows so the off-state reads visually
+            if not scene.get("enabled", True):
+                self.scene_listbox.itemconfig(i, fg="#666")
         if 0 <= self.active_scene_idx < len(self.scenes):
             self.scene_listbox.selection_set(self.active_scene_idx)
             self.scene_listbox.see(self.active_scene_idx)
+
+    def _toggle_scene_enabled(self):
+        if self.active_scene_idx < 0 or not self.scenes:
+            return
+        s = self.scenes[self.active_scene_idx]
+        s["enabled"] = not s.get("enabled", True)
+        self._refresh_scene_list()
+        n_on = sum(1 for x in self.scenes if x.get("enabled", True))
+        self.status_var.set(f"{n_on}/{len(self.scenes)} scenes enabled")
 
     def _on_scene_select(self, _event):
         sel = self.scene_listbox.curselection()
@@ -976,13 +1003,13 @@ class StudioApp:
 
     def _on_canvas_change(self):
         if 0 <= self.active_scene_idx < len(self.scenes):
-            self.scenes[self.active_scene_idx]["electrodes"] = self.canvas_widget.get_electrodes()
+            s = self.scenes[self.active_scene_idx]
+            s["electrodes"] = self.canvas_widget.get_electrodes()
             # Update listbox entry in place
-            placed = len(self.scenes[self.active_scene_idx]["electrodes"])
-            name = Path(self.scenes[self.active_scene_idx]["path"]).name
-            short = name if len(name) <= 22 else name[:19] + "..."
             self.scene_listbox.delete(self.active_scene_idx)
-            self.scene_listbox.insert(self.active_scene_idx, f"{short} ({placed}/4)")
+            self.scene_listbox.insert(self.active_scene_idx, self._scene_row_label(s))
+            if not s.get("enabled", True):
+                self.scene_listbox.itemconfig(self.active_scene_idx, fg="#666")
             self.scene_listbox.selection_set(self.active_scene_idx)
         n = len(self.canvas_widget.get_electrodes())
         self.electrode_count_label.config(text=f"Electrodes: {n}/4")
@@ -1026,9 +1053,17 @@ class StudioApp:
         if 0 <= self.active_scene_idx < len(self.scenes):
             self.scenes[self.active_scene_idx]["electrodes"] = self.canvas_widget.get_electrodes()
 
-        incomplete = [i for i, s in enumerate(self.scenes) if len(s["electrodes"]) != 4]
+        enabled_scenes = [s for s in self.scenes if s.get("enabled", True)]
+        if not enabled_scenes:
+            messagebox.showerror("No scenes enabled",
+                                 "Every scene is toggled off. Enable at least "
+                                 "one (Space / double-click / Toggle button) "
+                                 "before rendering.")
+            return
+
+        incomplete = [i for i, s in enumerate(enabled_scenes) if len(s["electrodes"]) != 4]
         if incomplete:
-            names = ", ".join(Path(self.scenes[i]["path"]).name for i in incomplete[:3])
+            names = ", ".join(Path(enabled_scenes[i]["path"]).name for i in incomplete[:3])
             more = "" if len(incomplete) <= 3 else f" +{len(incomplete)-3} more"
             if not messagebox.askyesno(
                 "Incomplete placements",
@@ -1044,7 +1079,7 @@ class StudioApp:
         scenes_snapshot = [{"path": Path(s["path"]),
                             "electrodes": dict(s["electrodes"]),
                             "overrides": dict(s.get("overrides", {}))}
-                           for s in self.scenes]
+                           for s in enabled_scenes]
 
         t = threading.Thread(
             target=self._render_worker,
@@ -1304,6 +1339,7 @@ class StudioApp:
                 "path": str(s["path"]),
                 "electrodes": {k: {"x": v[0], "y": v[1]} for k, v in s["electrodes"].items()},
                 "overrides": dict(s.get("overrides", {})),
+                "enabled": bool(s.get("enabled", True)),
             } for s in self.scenes],
         }
 
@@ -1357,6 +1393,7 @@ class StudioApp:
                 "path": path.resolve(),
                 "electrodes": electrodes,
                 "overrides": dict(s.get("overrides", {})),
+                "enabled": bool(s.get("enabled", True)),
             })
         self.active_scene_idx = 0 if self.scenes else -1
         self._refresh_scene_list()
